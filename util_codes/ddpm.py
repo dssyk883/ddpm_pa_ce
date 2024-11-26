@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from dataloader import MatDataset
 from torch.utils.data import DataLoader
-from pathlib import Path
 import argparse
 import gc
 
@@ -33,9 +31,6 @@ class ConditionalUNet(nn.Module):
         # Estimates (condition)
         cond = self.cond_proj(condition)
         cond = F.interpolate(cond, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        
-        # Time embedding
-        t = self.time_mlp(time.unsqueeze(-1))
         
         # Encoder
         x1 = F.relu(self.enc1(x))
@@ -100,8 +95,8 @@ class Diffusion:
             
         return x
 
-# Training setup
-def train_step(model, diffusion, x_0, condition, optimizer):
+# Training
+def train_step(diffusion, x_0, condition, optimizer):
     x_0, condition = x_0.to(diffusion.device), condition.to(diffusion.device)
     optimizer.zero_grad()
     
@@ -152,7 +147,6 @@ if __name__ == "__main__":
         transform=None,
         return_type=RETURN_TYPE)
 
-    # Create DataLoader for batch processing
     dataloader = DataLoader(mat_dataset, batch_size=args.batch_size, shuffle=True)
 
     mat_validation = MatDataset(
@@ -172,10 +166,6 @@ if __name__ == "__main__":
 
     test_dataloader = DataLoader(mat_testset, batch_size=args.batch_size, shuffle=False)
 
-    batch_size = args.batch_size
-    input_shape = (args.batch_size, 2, 120, 14)  # Target shape
-    condition_shape = (args.batch_size, 2, 18, 2)  # Pilot shape
-
     model = ConditionalUNet(hidden_dim=args.hidden, in_channels=2)
     diffusion = Diffusion(model, n_steps=args.tsteps, device="cuda")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -184,9 +174,9 @@ if __name__ == "__main__":
     num_epochs = args.epochs
     for epoch in range(num_epochs):
         model.train()
-        for batch in dataloader:  # Your dataloader
+        for batch in dataloader:  
             h_est, h_ideal, _ = batch
-            loss = train_step(model, diffusion, h_ideal, h_est, optimizer)
+            loss = train_step(diffusion, h_ideal, h_est, optimizer)
             print(f"Epoch {epoch}, Train Loss: {loss}")
         
         model.eval()
@@ -194,7 +184,7 @@ if __name__ == "__main__":
         num_batch = 0
         with torch.no_grad():
             for batch in validation_dataloader:
-                h_est, h_idea, _ = batch
+                h_est, h_ideal, _ = batch
                 val_loss += get_sample_loss(diffusion, h_est, h_ideal)
                 num_batch += 1
         val_loss /= num_batch
@@ -206,7 +196,7 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
         gc.collect()
 
-    mse_loss_avg = 0
+    log_loss_avg = 0
     num_batch = 0
 
     with torch.no_grad():
@@ -217,9 +207,9 @@ if __name__ == "__main__":
             h_ideal = h_ideal.to(diffusion.device)
             generated = diffusion.sample(h_est, shape=(h_est.shape[0], 2, 120, 14))
             mse = F.mse_loss(h_ideal, generated)
-            mse_loss_avg += mse.item()
-            print("MSE_LOSS: ", mse.item())
+            log_loss_avg += 10 * torch.log10(mse)
+            print("10log Loss: ", log_loss_avg)
             num_batch += 1
 
-    mse_loss_avg /= num_batch
-    print("Average MSE loss: ", mse_loss_avg)
+    log_loss_avg /= num_batch
+    print("Average 10log loss: ", log_loss_avg)

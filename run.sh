@@ -1,11 +1,13 @@
 python3 ./util_codes/ddpm.py \
 	--data_dir ./dataset \
-	--train_dir ./dataset/train_small \
+	--train_dir ./dataset/train \
 	--val_dir ./dataset/val_small \
 	--test_dir ./dataset/test/SNR_test_set/SNR_10 \
 	--batch_size 128 \
 	--tsteps 1000 \
 	--hidden 128 \
-	--lr 3e-4 \
-	--epochs 10 \
-	--device cuda:0
+	--lr 1e-5 \
+	--epochs 5 \
+	--device cuda:0 \
+	--every_n_epoch 1 \
+	--val_portion 0.05

@@ -277,6 +277,10 @@ def parse_params():
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--device', type=str, default='cuda:0', 
                       help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
+    parser.add_argument('--every_n_epoch', type=int, default=10,
+                      help='Run validation every n epochs')
+    parser.add_argument('--val_portion', type=float, default=1.0,
+                      help='Portion of validation set to use (0.0-1.0)')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -311,6 +315,14 @@ if __name__ == "__main__":
         return_type=RETURN_TYPE
     )
 
+    # Calculate validation subset size
+    val_size = int(len(mat_validation) * args.val_portion)
+    if val_size < len(mat_validation):
+        from torch.utils.data import Subset
+        import random
+        indices = random.sample(range(len(mat_validation)), val_size)
+        mat_validation = Subset(mat_validation, indices)
+
     validation_dataloader = DataLoader(mat_validation, batch_size=args.batch_size, shuffle=False)
 
     mat_testset = MatDataset(
@@ -326,7 +338,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
+        optimizer,
         T_max=args.epochs,
         eta_min=1e-6
     )
@@ -342,19 +354,21 @@ if __name__ == "__main__":
             loss = train_step(diffusion, h_ideal, h_est, optimizer)
             print(f"Epoch {epoch}, Train Loss: {loss}")
         
-        model.eval()
-        val_loss = 0
-        num_batch = 0
-        with torch.no_grad():
-            for batch in validation_dataloader:
-                h_est, h_ideal, _ = batch
-                val_loss += get_sample_loss(diffusion, h_est, h_ideal)
-                num_batch += 1
-        val_loss /= num_batch
-        print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_model.pth')
+        # Only run validation every n epochs or on the final epoch
+        if (epoch + 1) % args.every_n_epoch == 0 or epoch == num_epochs - 1:
+            model.eval()
+            val_loss = 0
+            num_batch = 0
+            with torch.no_grad():
+                for batch in validation_dataloader:
+                    h_est, h_ideal, _ = batch
+                    val_loss += get_sample_loss(diffusion, h_est, h_ideal)
+                    num_batch += 1
+            val_loss /= num_batch
+            print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), 'best_model.pth')
 
         scheduler.step()
 

@@ -6,42 +6,177 @@ from torch.utils.data import DataLoader
 import argparse
 import gc
 
-class ConditionalUNet(nn.Module):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # Skip connection if channel dimensions don't match
+        self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        
+    def forward(self, x):
+        identity = self.skip(x)
+        
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = x + identity
+        x = F.relu(x)
+        
+        return x
+
+class AttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.mha = nn.MultiheadAttention(channels, 4, batch_first=True)
+        self.ln = nn.LayerNorm([channels])
+        self.ff_self = nn.Sequential(
+            nn.LayerNorm([channels]),
+            nn.Linear(channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.mha(x, x, x)[0]
+        x = x + self.ff_self(x)
+        x = x.transpose(1, 2).view(-1, self.channels, *size)
+        return x
+
+class ConditionalUnet(nn.Module):
     def __init__(self, hidden_dim, in_channels=2):
         super().__init__()
-        # Encoder
-        self.enc1 = nn.Conv2d(in_channels, hidden_dim, 3, padding=1)
-        self.enc2 = nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1)
-	
-        # Decoder
-        self.dec1 = nn.Conv2d(hidden_dim*2, hidden_dim, 3, padding=1)
-        self.dec2 = nn.Conv2d(hidden_dim, in_channels, 3, padding=1)
-        
-        # Condition projection
-        self.cond_proj = nn.Conv2d(2, hidden_dim, 1)
         
         # Time embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-
-    def forward(self, x, condition, time):
-        # Estimates (condition)
-        cond = self.cond_proj(condition)
-        cond = F.interpolate(cond, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # Condition embedding - process 2x18x2 using convolutions
+        self.cond_proj = nn.Sequential(
+            nn.Conv2d(2, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU()
+        )
+        
+        # Spatial condition projections for each level
+        self.cond_spatial1 = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.GELU()
+        )
+        self.cond_spatial2 = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=1),
+            nn.GELU()
+        )
+        self.cond_spatial3 = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim * 4, kernel_size=1),
+            nn.GELU()
+        )
         
         # Encoder
-        x1 = F.relu(self.enc1(x))
-        x2 = F.relu(self.enc2(x1 + cond))
+        self.enc1 = nn.Sequential(
+            ResidualBlock(in_channels, hidden_dim),
+            ResidualBlock(hidden_dim, hidden_dim)
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        
+        self.enc2 = nn.Sequential(
+            ResidualBlock(hidden_dim, hidden_dim * 2),
+            ResidualBlock(hidden_dim * 2, hidden_dim * 2)
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        
+        self.enc3 = nn.Sequential(
+            ResidualBlock(hidden_dim * 2, hidden_dim * 4),
+            AttentionBlock(hidden_dim * 4),
+            ResidualBlock(hidden_dim * 4, hidden_dim * 4)
+        )
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            ResidualBlock(hidden_dim * 4, hidden_dim * 4),
+            AttentionBlock(hidden_dim * 4),
+            ResidualBlock(hidden_dim * 4, hidden_dim * 4)
+        )
         
         # Decoder
-        x = F.relu(self.dec1(x2))
-        x = self.dec2(x + cond)
+        self.dec3 = nn.Sequential(
+            ResidualBlock(hidden_dim * 8, hidden_dim * 4),
+            AttentionBlock(hidden_dim * 4),
+            ResidualBlock(hidden_dim * 4, hidden_dim * 2)
+        )
+        
+        self.dec2 = nn.Sequential(
+            ResidualBlock(hidden_dim * 4, hidden_dim * 2),
+            ResidualBlock(hidden_dim * 2, hidden_dim)
+        )
+        
+        self.dec1 = nn.Sequential(
+            ResidualBlock(hidden_dim * 2, hidden_dim),
+            ResidualBlock(hidden_dim, hidden_dim),
+            nn.Conv2d(hidden_dim, in_channels, 1)
+        )
+        
+    def forward(self, x, condition, time):
+        # Store original spatial dimensions
+        orig_h, orig_w = x.shape[-2:]  # 120, 14
+        
+        # Time embedding
+        t = self.time_mlp(time.unsqueeze(-1))
+        t = t.view(-1, t.shape[-1], 1, 1).repeat(1, 1, orig_h, orig_w)
+        
+        # Process condition with convolutions: [batch, 2, 18, 2] -> [batch, hidden_dim, 18, 2]
+        cond = self.cond_proj(condition)
+        
+        # Encoder pathway
+        # Level 1: Interpolate condition to match x1 spatial dimensions
+        cond1 = F.interpolate(cond, size=(orig_h, orig_w), mode='bilinear', align_corners=True)
+        cond1 = self.cond_spatial1(cond1)
+        x1 = self.enc1(x)
+        x1 = x1 + cond1 + t
+        
+        # Level 2
+        h2, w2 = orig_h // 2, orig_w // 2
+        x2_down = self.pool1(x1)
+        cond2 = F.interpolate(cond, size=(h2, w2), mode='bilinear', align_corners=True)
+        cond2 = self.cond_spatial2(cond2)
+        x2 = self.enc2(x2_down)
+        x2 = x2 + cond2
+        
+        # Level 3
+        h3, w3 = h2 // 2, w2 // 2
+        x3_down = self.pool2(x2)
+        cond3 = F.interpolate(cond, size=(h3, w3), mode='bilinear', align_corners=True)
+        cond3 = self.cond_spatial3(cond3)
+        x3 = self.enc3(x3_down)
+        x3 = x3 + cond3
+        
+        # Bottleneck
+        x_mid = self.bottleneck(x3)
+        
+        # Decoder pathway
+        x = self.dec3(torch.cat([x_mid, x3], dim=1))
+        x = F.interpolate(x, size=(h2, w2), mode='bilinear', align_corners=True)
+        
+        x = self.dec2(torch.cat([x, x2], dim=1))
+        x = F.interpolate(x, size=(orig_h, orig_w), mode='bilinear', align_corners=True)
+        
+        x = self.dec1(torch.cat([x, x1], dim=1))
         
         return x
-
+    
 def cosine_beta_schedule(timesteps):
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
@@ -104,9 +239,17 @@ def train_step(diffusion, x_0, condition, optimizer):
     t = torch.randint(0, diffusion.n_steps, (x_0.shape[0],), device=diffusion.device)
     
     # Calculate loss for training
-    loss = diffusion.get_loss(x_0, condition, t)
-    loss.backward()
-    optimizer.step()
+    # loss = diffusion.get_loss(x_0, condition, t)
+    # loss.backward()
+    with torch.amp.autocast(device_type='cuda'):
+        loss = diffusion.get_loss(x_0, condition, t)
+
+    scaler.scale(loss).backward()
+
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(diffusion.model.parameters(), max_norm=1.0)
+    scaler.step(optimizer)
+    scaler.update()
     
     return loss.item()
 
@@ -178,9 +321,17 @@ if __name__ == "__main__":
 
     test_dataloader = DataLoader(mat_testset, batch_size=args.batch_size, shuffle=False)
 
-    model = ConditionalUNet(hidden_dim=args.hidden, in_channels=2)
+    model = ConditionalUnet(hidden_dim=args.hidden, in_channels=2)
     diffusion = Diffusion(model, n_steps=args.tsteps, device=args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.epochs,
+        eta_min=1e-6
+    )
+
+    scaler = torch.amp.GradScaler()
 
     best_val_loss = float('inf')
     num_epochs = args.epochs
@@ -204,6 +355,8 @@ if __name__ == "__main__":
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), 'best_model.pth')
+
+        scheduler.step()
 
         torch.cuda.empty_cache()
         gc.collect()

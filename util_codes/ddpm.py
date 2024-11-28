@@ -12,7 +12,7 @@ class ConditionalUNet(nn.Module):
         # Encoder
         self.enc1 = nn.Conv2d(in_channels, hidden_dim, 3, padding=1)
         self.enc2 = nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1)
-        
+	
         # Decoder
         self.dec1 = nn.Conv2d(hidden_dim*2, hidden_dim, 3, padding=1)
         self.dec2 = nn.Conv2d(hidden_dim, in_channels, 3, padding=1)
@@ -118,7 +118,6 @@ def get_sample_loss(diffusion, h_est, h_ideal):
     return 10 * torch.log10(mse)
 
 PILOT_DIMS = (18, 2)
-
 TRANSFORM = None
 RETURN_TYPE = "2channel"
 
@@ -133,13 +132,26 @@ def parse_params():
     parser.add_argument('--hidden', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--device', type=str, default='cuda:0', 
+                      help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_params()
     config = vars(args)
     print("Started with configuration:", 
-    {k: v for k, v in config.items() if k in ['data_dir', 'batch_size', 'tsteps', 'hidden', 'lr', 'epochs']})
+    {k: v for k, v in config.items() if k in ['data_dir', 'batch_size', 'tsteps', 'hidden', 'lr', 'epochs', 'device']})
+
+    # Check if CUDA is available when cuda device is specified
+    if args.device.startswith('cuda') and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available but cuda device was specified")
+
+    # If cuda device is specified, verify it exists
+    if args.device.startswith('cuda'):
+        device_idx = int(args.device.split(':')[1])
+        if device_idx >= torch.cuda.device_count():
+            raise RuntimeError(f"Specified GPU {device_idx} is not available. "
+                             f"Available GPUs: {torch.cuda.device_count()}")
 
     mat_dataset = MatDataset(
         data_dir=args.train_dir,
@@ -167,7 +179,7 @@ if __name__ == "__main__":
     test_dataloader = DataLoader(mat_testset, batch_size=args.batch_size, shuffle=False)
 
     model = ConditionalUNet(hidden_dim=args.hidden, in_channels=2)
-    diffusion = Diffusion(model, n_steps=args.tsteps, device="cuda")
+    diffusion = Diffusion(model, n_steps=args.tsteps, device=args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     best_val_loss = float('inf')

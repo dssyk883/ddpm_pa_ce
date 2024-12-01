@@ -1,0 +1,7 @@
+python ./util_codes/ddpm_test.py \
+    --test_dir ./small_dataset/dataset_small/test_small \
+    --model_path best_model.pth \
+    --batch_size 64 \
+    --tsteps 500 \
+    --hidden 384 \
+    --device cuda:0

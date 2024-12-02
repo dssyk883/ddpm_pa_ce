@@ -306,7 +306,7 @@ class Diffusion:
         return x
 
 # Training
-def train_step(diffusion, x_0, condition, optimizer, scheduler, scaler):
+def train_step(diffusion, x_0, condition, optimizer):
     x_0, condition = x_0.to(diffusion.device), condition.to(diffusion.device)
     optimizer.zero_grad()
     
@@ -314,17 +314,15 @@ def train_step(diffusion, x_0, condition, optimizer, scheduler, scaler):
     t = torch.randint(0, diffusion.n_steps, (x_0.shape[0],), device=diffusion.device)
     
     # Calculate loss for training
-    # loss = diffusion.get_loss(x_0, condition, t)
-    # loss.backward()
-    with torch.amp.autocast(device_type='cuda'):
-        loss = diffusion.get_loss(x_0, condition, t)
+    
+    # with torch.amp.autocast(device_type='cuda'):
+    #     loss = diffusion.get_loss(x_0, condition, t)
 
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
+    loss = diffusion.get_loss(x_0, condition, t)
+    loss.backward()
+    optimizer.step()
     torch.nn.utils.clip_grad_norm_(diffusion.model.parameters(), max_norm=0.5)
 
-    scaler.step(optimizer)
-    scaler.update()
     # scheduler.step()
 
     return loss.item()
@@ -442,7 +440,7 @@ if __name__ == "__main__":
         model.train()
         for batch in dataloader:  
             h_est, h_ideal, _ = batch
-            loss = train_step(diffusion, h_ideal, h_est, optimizer, scheduler, scaler)
+            loss = train_step(diffusion, h_ideal, h_est, optimizer)
             print(f"Epoch {epoch}, Train Loss: {loss}")
         
         # Only run validation every n epochs or on the final epoch

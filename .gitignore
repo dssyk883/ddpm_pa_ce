@@ -4,3 +4,4 @@ dataset/
 .idea/
 checkpoints/
 *.txt
+test_results/

@@ -3,3 +3,4 @@ dataset/
 *.pth
 .idea/
 checkpoints/
+*.txt

@@ -295,7 +295,7 @@ class Diffusion:
         return mse_loss, db_loss
 
     @torch.no_grad()
-    def sample(self, condition, shape):
+    def sample(self, condition, shape, progress_callback=None):
         x = torch.randn(shape).to(self.device)
 
         for t in reversed(range(self.n_steps)):
@@ -313,6 +313,9 @@ class Diffusion:
 
             x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * predicted_noise) + torch.sqrt(
                 beta) * noise
+
+            if progress_callback:
+                progress_callback(t)
 
         return x
 

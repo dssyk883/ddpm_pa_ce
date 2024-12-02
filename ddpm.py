@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataloader import MatDataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import argparse
+import random
 
 
 class CrossAttention(nn.Module):
@@ -339,7 +340,6 @@ RETURN_TYPE = "2channel"
 
 def parse_params():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--train_dir', type=str, required=True)
     parser.add_argument('--val_dir', type=str, required=True)
     parser.add_argument('--test_dir', type=str, required=True)
@@ -348,19 +348,26 @@ def parse_params():
     parser.add_argument('--hidden', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--device', type=str, default='cuda:0', 
-                      help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
-    parser.add_argument('--every_n_epoch', type=int, default=10,
-                      help='Run validation every n epochs')
-    parser.add_argument('--val_portion', type=float, default=1.0,
-                      help='Portion of validation set to use (0.0-1.0)')
+    parser.add_argument(
+        '--patience', type=int, default=20,
+        help="Earlystopping patience, keep this large, as it "
+             "does not make much sense to early stop while"
+             " training diffusion models")
+    parser.add_argument(
+        '--device', type=str, default='cuda:0',
+        help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
+    parser.add_argument(
+        '--every_n_epoch', type=int, default=10,
+        help='Run validation every n epochs')
+    parser.add_argument(
+        '--val_portion', type=float, default=1.0,
+        help='Portion of validation set to use (0.0-1.0)')
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_params()
     config = vars(args)
-    print("Started with configuration:", 
-    {k: v for k, v in config.items() if k in ['data_dir', 'batch_size', 'tsteps', 'hidden', 'lr', 'epochs', 'device']})
+    print("Started with configuration:", {k: v for k, v in config.items()})
 
     # Check if CUDA is available when cuda device is specified
     if args.device.startswith('cuda') and not torch.cuda.is_available():
@@ -376,7 +383,6 @@ if __name__ == "__main__":
     mat_dataset = MatDataset(
         data_dir=args.train_dir,
         pilot_dims=PILOT_DIMS,
-        transform=None,
         return_type=RETURN_TYPE)
 
     dataloader = DataLoader(mat_dataset, batch_size=args.batch_size, shuffle=True)
@@ -385,26 +391,15 @@ if __name__ == "__main__":
         data_dir=args.val_dir,
         pilot_dims=PILOT_DIMS,
         transform=None,
-        return_type=RETURN_TYPE
-    )
+        return_type=RETURN_TYPE)
     
     # Calculate validation subset size
     val_size = int(len(mat_validation) * args.val_portion)
     if val_size < len(mat_validation):
-        from torch.utils.data import Subset
-        import random
         indices = random.sample(range(len(mat_validation)), val_size)
         mat_validation = Subset(mat_validation, indices)
 
     validation_dataloader = DataLoader(mat_validation, batch_size=args.batch_size, shuffle=False)
-
-    mat_testset = MatDataset(
-        data_dir=args.test_dir,
-        pilot_dims=PILOT_DIMS,
-        transform=None,
-        return_type=RETURN_TYPE)
-
-    test_dataloader = DataLoader(mat_testset, batch_size=args.batch_size, shuffle=False)
 
     model = ConditionalUnet(hidden_dim=args.hidden, in_channels=2)
     diffusion = Diffusion(model, n_steps=args.tsteps, device=args.device)
@@ -416,18 +411,6 @@ if __name__ == "__main__":
         eta_min=1e-6
     )
 
-    # total_steps = len(dataloader) * args.epochs
-
-    # Initialize scheduler with warmup
-    # scheduler = OneCycleLR(
-    #     optimizer,
-    #     max_lr=args.lr,
-    #     total_steps=len(dataloader) * args.epochs,
-    #     pct_start=0.3,  # 10% of total steps for warmup
-    #     div_factor=25,  # initial_lr = max_lr/25
-    #     final_div_factor=1e4,  # min_lr = initial_lr/1000
-    #     )
-
     scaler = torch.amp.GradScaler()
 
     best_val_loss = float('inf')
@@ -435,7 +418,6 @@ if __name__ == "__main__":
     patience_counter = 0
 
     for epoch in range(num_epochs):
-        # Train
         model.train()
         for batch in dataloader:  
             h_est, h_ideal, _ = batch
@@ -461,10 +443,8 @@ if __name__ == "__main__":
             else:
                 patience_counter += 1
 
-            if patience_counter >= 3:
+            if patience_counter >= args.patience:
                 print("Early Stopping")
                 break
         
         scheduler.step()
-        # torch.cuda.empty_cache()
-        # gc.collect()

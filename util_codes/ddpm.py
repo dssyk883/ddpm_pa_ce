@@ -5,10 +5,10 @@ from dataloader import MatDataset
 from torch.utils.data import DataLoader
 import argparse
 import gc
-from torch.optim.lr_scheduler import OneCycleLR
+# from torch.optim.lr_scheduler import OneCycleLR
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, key_dim, num_heads=4):
+    def __init__(self, query_dim, key_dim, num_heads=8):
         super().__init__()
         self.num_heads = num_heads
         self.scale = (query_dim // num_heads) ** -0.5
@@ -267,8 +267,8 @@ class Diffusion:
         self.device = device
         
         # Noise schedule
-        self.betas = torch.linspace(1e-4, 0.02, n_steps).to(device) # Original
-        # self.betas = cosine_beta_schedule(n_steps).to(device) # Cosine beta scheduler s=0.008
+        # self.betas = torch.linspace(1e-4, 0.02, n_steps).to(device) # Original
+        self.betas = cosine_beta_schedule(n_steps).to(device) # Cosine beta scheduler s=0.008
         self.alphas = 1. - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
@@ -306,7 +306,7 @@ class Diffusion:
         return x
 
 # Training
-def train_step(diffusion, x_0, condition, optimizer):
+def train_step(diffusion, x_0, condition, optimizer, scheduler, scaler):
     x_0, condition = x_0.to(diffusion.device), condition.to(diffusion.device)
     optimizer.zero_grad()
     
@@ -320,14 +320,13 @@ def train_step(diffusion, x_0, condition, optimizer):
         loss = diffusion.get_loss(x_0, condition, t)
 
     scaler.scale(loss).backward()
-
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(diffusion.model.parameters(), max_norm=0.5)
+
     scaler.step(optimizer)
     scaler.update()
+    # scheduler.step()
 
-    scheduler.step()
-    
     return loss.item()
 
 def get_sample_loss(diffusion, h_est, h_ideal):
@@ -354,6 +353,10 @@ def parse_params():
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--device', type=str, default='cuda:0', 
                       help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
+    parser.add_argument('--every_n_epoch', type=int, default=10,
+                      help='Run validation every n epochs')
+    parser.add_argument('--val_portion', type=float, default=1.0,
+                      help='Portion of validation set to use (0.0-1.0)')
     return parser.parse_args()
 
 if __name__ == "__main__":
@@ -387,6 +390,14 @@ if __name__ == "__main__":
         transform=None,
         return_type=RETURN_TYPE
     )
+    
+    # Calculate validation subset size
+    val_size = int(len(mat_validation) * args.val_portion)
+    if val_size < len(mat_validation):
+        from torch.utils.data import Subset
+        import random
+        indices = random.sample(range(len(mat_validation)), val_size)
+        mat_validation = Subset(mat_validation, indices)
 
     validation_dataloader = DataLoader(mat_validation, batch_size=args.batch_size, shuffle=False)
 
@@ -400,52 +411,63 @@ if __name__ == "__main__":
 
     model = ConditionalUnet(hidden_dim=args.hidden, in_channels=2)
     diffusion = Diffusion(model, n_steps=args.tsteps, device=args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0001)
 
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer, 
-    #     T_max=args.epochs,
-    #     eta_min=1e-6
-    # )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=args.epochs,
+        eta_min=1e-6
+    )
 
-    total_steps = len(dataloader) * args.epochs
+    # total_steps = len(dataloader) * args.epochs
 
     # Initialize scheduler with warmup
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=0.1,  # 10% of total steps for warmup
-        div_factor=25,  # initial_lr = max_lr/25
-        final_div_factor=1000,  # min_lr = initial_lr/1000
-        )
+    # scheduler = OneCycleLR(
+    #     optimizer,
+    #     max_lr=args.lr,
+    #     total_steps=len(dataloader) * args.epochs,
+    #     pct_start=0.3,  # 10% of total steps for warmup
+    #     div_factor=25,  # initial_lr = max_lr/25
+    #     final_div_factor=1e4,  # min_lr = initial_lr/1000
+    #     )
 
     scaler = torch.amp.GradScaler()
 
     best_val_loss = float('inf')
     num_epochs = args.epochs
+    patience_counter = 0
+
     for epoch in range(num_epochs):
         # Train
         model.train()
         for batch in dataloader:  
             h_est, h_ideal, _ = batch
-            loss = train_step(diffusion, h_ideal, h_est, optimizer)
+            loss = train_step(diffusion, h_ideal, h_est, optimizer, scheduler, scaler)
             print(f"Epoch {epoch}, Train Loss: {loss}")
         
-        # Validation
-        model.eval()
-        val_loss = 0
-        num_batch = 0
-        with torch.no_grad():
-            for batch in validation_dataloader:
-                h_est, h_ideal, _ = batch
-                val_loss += get_sample_loss(diffusion, h_est, h_ideal)
-                num_batch += 1
-        val_loss /= num_batch
-        print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_model.pth')
+        # Only run validation every n epochs or on the final epoch
+        if (epoch + 1) % args.every_n_epoch == 0 or epoch == num_epochs - 1:
+            model.eval()
+            val_loss = 0
+            num_batch = 0
+            with torch.no_grad():
+                for batch in validation_dataloader:
+                    h_est, h_ideal, _ = batch
+                    val_loss += get_sample_loss(diffusion, h_est, h_ideal)
+                    num_batch += 1
+            val_loss /= num_batch
+            print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), 'best_model.pth')
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-        torch.cuda.empty_cache()
-        gc.collect()
+            if patience_counter >= 3:
+                print("Early Stopping")
+                break
+        
+        scheduler.step()
+        # torch.cuda.empty_cache()
+        # gc.collect()

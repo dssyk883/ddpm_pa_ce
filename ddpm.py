@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from dataloader import MatDataset
 from torch.utils.data import DataLoader
 import argparse
-import gc
-# from torch.optim.lr_scheduler import OneCycleLR
+
 
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, key_dim, num_heads=8):

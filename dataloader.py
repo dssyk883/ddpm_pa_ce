@@ -8,7 +8,6 @@ from typing import Callable, List, Optional, Tuple, Union
 import scipy.io as sio
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchgen.executorch.api.et_cpp import return_type
 
 from utils import ComplexChannelProcessor
 

@@ -1,0 +1,13 @@
+python ddpm.py \
+          --data_dir ./dataset \
+          --train_dir ./dataset/train_small \
+          --val_dir ./dataset/val_small \
+          --test_dir ./dataset/test/SNR_test_set/SNR_10 \
+          --batch_size 64 \
+          --tsteps 500  \
+          --hidden 256 \
+          --lr 3e-4 \
+          --epochs 75 \
+          --every_n_epoch 10 \
+          --device cuda:0 \
+          --val_portion 0.01

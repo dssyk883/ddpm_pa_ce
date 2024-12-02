@@ -58,22 +58,10 @@ def load_config(checkpoint_path):
     return config
 
 
-def calculate_nmse(generated, h_ideal, h_est):
-    error = generated - h_ideal
-    error_power = torch.sum(torch.mul(error, error))
-    pilot_power = torch.sum(torch.mul(h_est, h_est))
-
-    nmse = error_power / pilot_power
-
-    return nmse
-
-
 def calculate_avg_nmse_db(model, diffusion, dataloader, device):
     """Calculate average 10*log10(NMSE) for the dataset using diffusion model"""
     model.eval()
-    total_nmse = 0
-    num_batches = 0
-    all_nmses = []
+    nmse_values = []
 
     with torch.no_grad():
         for inputs, targets, _ in tqdm(dataloader, desc='Calculating NMSE'):
@@ -81,24 +69,27 @@ def calculate_avg_nmse_db(model, diffusion, dataloader, device):
             targets = targets.to(device)
 
             # Generate samples using diffusion process
-            generated = diffusion.sample(
+            outputs = diffusion.sample(
                 inputs,
                 shape=(inputs.shape[0], 2, 120, 14)
             )
 
-            # Calculate NMSE using your method
-            nmse = calculate_nmse(generated, targets, inputs)
-            log_nmse = 10 * torch.log10(nmse)
-            all_nmses.append(log_nmse.item())
+            # Calculate squared error
+            squared_error = torch.nn.functional.mse_loss(outputs, targets, reduction='none')
 
-            total_nmse += log_nmse.item()
-            num_batches += 1
+            # Calculate power of the target signal
+            target_power = torch.mean(targets ** 2, dim=(1, 2, 3))
 
-            # Free memory
-            torch.cuda.empty_cache()
-            gc.collect()
+            # Calculate NMSE
+            epsilon = 1e-10
+            nmse = torch.mean(squared_error, dim=(1, 2, 3)) / (target_power + epsilon)
 
-    return float(total_nmse / num_batches)
+            # Convert to dB scale
+            nmse_db = 10 * torch.log10(nmse)
+
+            nmse_values.extend(nmse_db.cpu().numpy())
+
+    return float(np.mean(nmse_values))
 
 
 def process_quantitative_results(model, diffusion, dataloaders, device, output_dir, is_noisy):
@@ -123,7 +114,6 @@ def process_quantitative_results(model, diffusion, dataloaders, device, output_d
     df.to_csv(csv_path, index=False)
 
     return csv_path
-
 
 def generate_qualitative_samples(model, diffusion, sample_path, output_dir, device):
     """Generate and save samples for qualitative analysis using diffusion model"""
@@ -167,10 +157,6 @@ def generate_qualitative_samples(model, diffusion, sample_path, output_dir, devi
         # Store for grid visualization
         all_outputs.append(output_np)
         file_names.append(mat_file.stem)
-
-        # Free memory
-        torch.cuda.empty_cache()
-        gc.collect()
 
     # Create a grid visualization of magnitudes
     fig, axes = plt.subplots(3, 2, figsize=(12, 15))

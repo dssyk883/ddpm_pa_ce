@@ -11,7 +11,6 @@ import json
 import glob
 import torch
 from datetime import datetime
-import warnings
 
 
 class CrossAttention(nn.Module):
@@ -343,7 +342,18 @@ def train_step(diffusion, x_0, condition, optimizer, scheduler):
 def get_sample_loss(diffusion, h_est, h_ideal):
     h_est = h_est.to(diffusion.device)
     h_ideal = h_ideal.to(diffusion.device)
-    generated = diffusion.sample(h_est, shape=(h_est.shape[0], 2, 120, 14))
+
+    # Create a progress callback function
+    def progress_callback(t):
+        # Update progress only at certain intervals to avoid flooding the output
+        if t % 25 == 0 or t == diffusion.n_steps - 1:
+            print(f"\rDenoising step {diffusion.n_steps - t}/{diffusion.n_steps}", end="")
+
+    # Generate samples with progress
+    generated = diffusion.sample(h_est, shape=(h_est.shape[0], 2, 120, 14),
+                                 progress_callback=progress_callback)
+    print()  # New line after progress is complete
+
     mse = F.mse_loss(h_ideal, generated)
     return 10 * torch.log10(mse)
 
@@ -667,11 +677,11 @@ if __name__ == "__main__":
             val_loss = 0
             num_batch = 0
 
-            # Added tqdm progress bar for validation
+            # Added tqdm progress bar for validation batches
             val_progress_bar = tqdm(validation_dataloader, desc=f'Epoch {epoch} Validation')
 
             with torch.no_grad():
-                for batch in val_progress_bar:
+                for batch_idx, batch in enumerate(val_progress_bar):
                     h_est, h_ideal, _ = batch
                     batch_loss = get_sample_loss(diffusion, h_est, h_ideal)
                     val_loss += batch_loss
@@ -680,7 +690,7 @@ if __name__ == "__main__":
 
             val_loss /= num_batch
             val_loss_history.append(val_loss)
-            print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
+            print(f"\nValidation Loss 10log(AVG_MSE): {val_loss}")
 
             is_best = val_loss < best_val_loss
             if is_best:

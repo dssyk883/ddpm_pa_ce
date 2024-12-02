@@ -1,10 +1,17 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataloader import MatDataset
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 import argparse
 import random
+import sys
+import os
+import json
+import glob
+import torch
+from datetime import datetime
+import warnings
 
 
 class CrossAttention(nn.Module):
@@ -260,72 +267,75 @@ def cosine_beta_schedule(timesteps):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0.0001, 0.02)
 
+
 class Diffusion:
     def __init__(self, model, n_steps=1000, device="cuda"):
         self.model = model.to(device)
         self.n_steps = n_steps
         self.device = device
-        
+
         # Noise schedule
-        # self.betas = torch.linspace(1e-4, 0.02, n_steps).to(device) # Original
-        self.betas = cosine_beta_schedule(n_steps).to(device) # Cosine beta scheduler s=0.008
+        self.betas = cosine_beta_schedule(n_steps).to(device)
         self.alphas = 1. - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
     def get_loss(self, x_0, condition, t):
         noise = torch.randn_like(x_0)
         alpha_bar = self.alpha_bars[t].view(-1, 1, 1, 1)
-        
+
         # Add noise
         x_t = torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * noise
-        
+
         # Predict noise
         pred = self.model(x_t, condition, t.float())
-        
-        return F.mse_loss(pred, noise)
+
+        # Return both MSE loss and dB loss for consistent metrics
+        mse_loss = F.mse_loss(pred, noise)
+        db_loss = 10 * torch.log10(mse_loss)
+        return mse_loss, db_loss
 
     @torch.no_grad()
     def sample(self, condition, shape):
         x = torch.randn(shape).to(self.device)
-        
+
         for t in reversed(range(self.n_steps)):
             t_batch = torch.tensor([t], device=self.device).repeat(shape[0])
             predicted_noise = self.model(x, condition, t_batch.float())
-            
+
             alpha = self.alphas[t]
             alpha_bar = self.alpha_bars[t]
             beta = self.betas[t]
-            
+
             if t > 0:
                 noise = torch.randn_like(x)
             else:
                 noise = 0
-                
-            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * predicted_noise) + torch.sqrt(beta) * noise
-            
+
+            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * predicted_noise) + torch.sqrt(
+                beta) * noise
+
         return x
 
-# Training
-def train_step(diffusion, x_0, condition, optimizer):
+
+def train_step(diffusion, x_0, condition, optimizer, scheduler):
     x_0, condition = x_0.to(diffusion.device), condition.to(diffusion.device)
     optimizer.zero_grad()
-    
+
     # Random timesteps (0, timesteps)
     t = torch.randint(0, diffusion.n_steps, (x_0.shape[0],), device=diffusion.device)
-    
-    # Calculate loss for training
-    
-    # with torch.amp.autocast(device_type='cuda'):
-    #     loss = diffusion.get_loss(x_0, condition, t)
 
-    loss = diffusion.get_loss(x_0, condition, t)
-    loss.backward()
-    optimizer.step()
+    # Calculate loss for training - now returns both MSE and dB loss
+    mse_loss, db_loss = diffusion.get_loss(x_0, condition, t)
+    mse_loss.backward()
+
+    # Gradient clipping
     torch.nn.utils.clip_grad_norm_(diffusion.model.parameters(), max_norm=0.5)
 
-    # scheduler.step()
+    optimizer.step()
+    scheduler.step()
 
-    return loss.item()
+    return db_loss.item()  # Return dB loss for consistent metrics
+
 
 def get_sample_loss(diffusion, h_est, h_ideal):
     h_est = h_est.to(diffusion.device)
@@ -334,56 +344,261 @@ def get_sample_loss(diffusion, h_est, h_ideal):
     mse = F.mse_loss(h_ideal, generated)
     return 10 * torch.log10(mse)
 
-PILOT_DIMS = (18, 2)
-TRANSFORM = None
-RETURN_TYPE = "2channel"
+
+def save_checkpoint(epoch, model, optimizer, scheduler, train_loss, val_loss, output_dir, is_best=False, max_keep=5):
+    """
+    Save checkpoint with training state and metrics.
+
+    Args:
+        epoch (int): Current epoch number
+        model (nn.Module): Model to save
+        optimizer (Optimizer): Optimizer state to save
+        scheduler (LRScheduler): Learning rate scheduler state to save
+        train_loss (float/tensor): Training loss value
+        val_loss (float/tensor): Validation loss value
+        output_dir (str): Directory to save checkpoints
+        is_best (bool): Whether this is the best model so far
+        max_keep (int): Maximum number of recent checkpoints to keep
+    """
+    try:
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Helper function to convert tensors to Python native types
+        def convert_tensor(value):
+            if torch.is_tensor(value):
+                # If it's a tensor on GPU, first move to CPU
+                if value.is_cuda:
+                    value = value.cpu()
+                # Convert to Python number
+                if value.numel() == 1:
+                    return value.item()
+                # If it's a multi-element tensor, convert to list
+                return value.tolist()
+            return value
+
+        # Recursively convert dictionary values from tensors to native Python types
+        def convert_dict(d):
+            output = {}
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    output[k] = convert_dict(v)
+                elif isinstance(v, (list, tuple)):
+                    output[k] = [convert_tensor(x) if torch.is_tensor(x) else x for x in v]
+                else:
+                    output[k] = convert_tensor(v)
+            return output
+
+        # Convert loss values to Python native types
+        train_loss_value = convert_tensor(train_loss)
+        val_loss_value = convert_tensor(val_loss)
+
+        # Prepare checkpoint data
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': train_loss_value,
+            'val_loss': val_loss_value,
+            'timestamp': datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        }
+
+        # Save regular checkpoint
+        checkpoint_filename = f'checkpoint_epoch_{epoch}.pth'
+        checkpoint_path = os.path.join(output_dir, checkpoint_filename)
+
+        # Use safe save pattern
+        temp_path = checkpoint_path + '.temp'
+        torch.save(checkpoint, temp_path)
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+        os.rename(temp_path, checkpoint_path)
+
+        # Save best model if this is the best performance
+        if is_best:
+            best_path = os.path.join(output_dir, 'best_model.pth')
+            temp_best_path = best_path + '.temp'
+            torch.save(checkpoint, temp_best_path)
+            if os.path.exists(best_path):
+                os.remove(best_path)
+            os.rename(temp_best_path, best_path)
+
+        # Manage checkpoint history
+        checkpoints = glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pth'))
+        checkpoints = sorted(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+
+        # Remove old checkpoints if exceeding max_keep
+        while len(checkpoints) > max_keep:
+            checkpoint_to_remove = checkpoints.pop(0)  # Remove oldest checkpoint
+            try:
+                os.remove(checkpoint_to_remove)
+            except OSError as e:
+                print(f"Warning: Could not remove old checkpoint {checkpoint_to_remove}: {e}")
+
+        # Update metrics log
+        metrics_file = os.path.join(output_dir, 'training_metrics.json')
+        metrics = {'epochs': []}
+
+        # Load existing metrics if they exist
+        if os.path.exists(metrics_file):
+            try:
+                with open(metrics_file, 'r') as f:
+                    metrics = json.load(f)
+            except json.JSONDecodeError:
+                print(f"Warning: Could not read existing metrics file. Creating new one.")
+                metrics = {'epochs': []}
+
+        # Add new epoch metrics (ensuring all values are JSON serializable)
+        epoch_metrics = {
+            'epoch': epoch,
+            'train_loss': train_loss_value,
+            'val_loss': val_loss_value,
+            'is_best': is_best,
+            'checkpoint_path': checkpoint_filename,
+            'timestamp': checkpoint['timestamp']
+        }
+
+        # Convert any remaining tensor values to Python native types
+        epoch_metrics = convert_dict(epoch_metrics)
+        metrics['epochs'].append(epoch_metrics)
+
+        # Save metrics with safe write pattern
+        temp_metrics_file = metrics_file + '.temp'
+        with open(temp_metrics_file, 'w') as f:
+            json.dump(metrics, f, indent=4)
+        if os.path.exists(metrics_file):
+            os.remove(metrics_file)
+        os.rename(temp_metrics_file, metrics_file)
+
+        return checkpoint_path
+
+    except Exception as e:
+        print(f"Error saving checkpoint: {str(e)}")
+        raise
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
+    """Load checkpoint and return training state with better error handling."""
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')  # Load to CPU first
+
+        # Verify checkpoint contents
+        required_keys = ['model_state_dict', 'optimizer_state_dict',
+                         'scheduler_state_dict', 'epoch', 'train_loss', 'val_loss']
+        for key in required_keys:
+            if key not in checkpoint:
+                raise KeyError(f"Checkpoint missing required key: {key}")
+
+        # Load state dicts
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        return checkpoint['epoch'], checkpoint['train_loss'], checkpoint['val_loss']
+
+    except EOFError:
+        print(f"Error: Checkpoint file {checkpoint_path} appears to be corrupted")
+        raise
+    except KeyError as e:
+        print(f"Error: Invalid checkpoint format - {str(e)}")
+        raise
+    except Exception as e:
+        print(f"Error loading checkpoint: {str(e)}")
+        raise
+
+
+def verify_checkpoint(checkpoint_path):
+    """Verify if checkpoint file is valid."""
+    try:
+        # Try to load just the metadata first
+        file_size = os.path.getsize(checkpoint_path)
+        if file_size == 0:
+            print(f"Error: Checkpoint file {checkpoint_path} is empty")
+            return False
+
+        # Try to load the checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        required_keys = ['model_state_dict', 'optimizer_state_dict',
+                         'scheduler_state_dict', 'epoch', 'train_loss', 'val_loss']
+
+        for key in required_keys:
+            if key not in checkpoint:
+                print(f"Error: Checkpoint missing required key: {key}")
+                return False
+
+        print(f"Checkpoint verification successful - contains data for epoch {checkpoint['epoch']}")
+        return True
+
+    except Exception as e:
+        print(f"Error verifying checkpoint: {str(e)}")
+        return False
 
 def parse_params():
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, required=True)
     parser.add_argument('--val_dir', type=str, required=True)
-    parser.add_argument('--test_dir', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='Directory to save checkpoints and metrics')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--tsteps', type=int, default=1000)
     parser.add_argument('--hidden', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument(
-        '--patience', type=int, default=20,
-        help="Earlystopping patience, keep this large, as it "
-             "does not make much sense to early stop while"
-             " training diffusion models")
-    parser.add_argument(
-        '--device', type=str, default='cuda:0',
-        help='Device to run on (e.g., cuda:0, cuda:1, cpu)')
-    parser.add_argument(
-        '--every_n_epoch', type=int, default=10,
-        help='Run validation every n epochs')
-    parser.add_argument(
-        '--val_portion', type=float, default=1.0,
-        help='Portion of validation set to use (0.0-1.0)')
+    parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--every_n_epoch', type=int, default=10)
+    parser.add_argument('--val_portion', type=float, default=1.0)
+    parser.add_argument('--train_portion', type=float, default=1.0)
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
     return parser.parse_args()
 
+
 if __name__ == "__main__":
+    PILOT_DIMS = (18, 2)
+    TRANSFORM = None
+    RETURN_TYPE = "2channel"
+
     args = parse_params()
+
+    # If checkpoint specified, verify it first
+    if args.checkpoint:
+        print(f"Verifying checkpoint: {args.checkpoint}")
+        if not verify_checkpoint(args.checkpoint):
+            print("Error: Invalid checkpoint file. Please check the file and try again.")
+            sys.exit(1)
+
     config = vars(args)
     print("Started with configuration:", {k: v for k, v in config.items()})
 
-    # Check if CUDA is available when cuda device is specified
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Save configuration
+    config_path = os.path.join(args.output_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+
+    # Device checks
     if args.device.startswith('cuda') and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available but cuda device was specified")
 
-    # If cuda device is specified, verify it exists
     if args.device.startswith('cuda'):
         device_idx = int(args.device.split(':')[1])
         if device_idx >= torch.cuda.device_count():
             raise RuntimeError(f"Specified GPU {device_idx} is not available. "
-                             f"Available GPUs: {torch.cuda.device_count()}")
+                               f"Available GPUs: {torch.cuda.device_count()}")
 
+    # Dataset setup
     mat_dataset = MatDataset(
         data_dir=args.train_dir,
         pilot_dims=PILOT_DIMS,
         return_type=RETURN_TYPE)
+
+    train_size = int(len(mat_dataset) * args.train_portion)
+    if train_size < len(mat_dataset):
+        indices = random.sample(range(len(mat_dataset)), train_size)
+        mat_dataset = Subset(mat_dataset, indices)
 
     dataloader = DataLoader(mat_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -392,8 +607,7 @@ if __name__ == "__main__":
         pilot_dims=PILOT_DIMS,
         transform=None,
         return_type=RETURN_TYPE)
-    
-    # Calculate validation subset size
+
     val_size = int(len(mat_validation) * args.val_portion)
     if val_size < len(mat_validation):
         indices = random.sample(range(len(mat_validation)), val_size)
@@ -401,50 +615,86 @@ if __name__ == "__main__":
 
     validation_dataloader = DataLoader(mat_validation, batch_size=args.batch_size, shuffle=False)
 
+    # Model setup
     model = ConditionalUnet(hidden_dim=args.hidden, in_channels=2)
     diffusion = Diffusion(model, n_steps=args.tsteps, device=args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0001)
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
+        optimizer,
         T_max=args.epochs,
         eta_min=1e-6
     )
 
-    scaler = torch.amp.GradScaler()
-
+    # Initialize training state
+    start_epoch = 0
     best_val_loss = float('inf')
-    num_epochs = args.epochs
-    patience_counter = 0
+    train_loss_history = []
+    val_loss_history = []
 
-    for epoch in range(num_epochs):
+    if args.checkpoint:
+        try:
+            start_epoch, last_train_loss, last_val_loss = load_checkpoint(
+                args.checkpoint, model, optimizer, scheduler)
+            print(f"Successfully loaded checkpoint from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {str(e)}")
+            print("Starting training from scratch...")
+            start_epoch = 0
+            best_val_loss = float('inf')
+
+    # Training loop
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        for batch in dataloader:  
+        running_loss = 0
+        progress_bar = tqdm(dataloader, desc=f'Epoch {epoch} Training')
+
+        for batch in progress_bar:
             h_est, h_ideal, _ = batch
-            loss = train_step(diffusion, h_ideal, h_est, optimizer)
-            print(f"Epoch {epoch}, Train Loss: {loss}")
-        
-        # Only run validation every n epochs or on the final epoch
-        if (epoch + 1) % args.every_n_epoch == 0 or epoch == num_epochs - 1:
+            loss = train_step(diffusion, h_ideal, h_est, optimizer, scheduler)
+            running_loss += loss
+            progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+
+        avg_train_loss = running_loss / len(dataloader)
+        print(f"\nEpoch {epoch} Average Training Loss: {avg_train_loss:.4f}")
+        train_loss_history.append(avg_train_loss)
+
+        # Validation and checkpointing
+        if (epoch + 1) % args.every_n_epoch == 0 or epoch == args.epochs - 1:
             model.eval()
             val_loss = 0
             num_batch = 0
-            with torch.no_grad():
-                for batch in validation_dataloader:
-                    h_est, h_ideal, _ = batch
-                    val_loss += get_sample_loss(diffusion, h_est, h_ideal)
-                    num_batch += 1
-            val_loss /= num_batch
-            print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(model.state_dict(), 'best_model.pth')
-                patience_counter = 0
-            else:
-                patience_counter += 1
 
-            if patience_counter >= args.patience:
-                print("Early Stopping")
-                break
-        
+            # Added tqdm progress bar for validation
+            val_progress_bar = tqdm(validation_dataloader, desc=f'Epoch {epoch} Validation')
+
+            with torch.no_grad():
+                for batch in val_progress_bar:
+                    h_est, h_ideal, _ = batch
+                    batch_loss = get_sample_loss(diffusion, h_est, h_ideal)
+                    val_loss += batch_loss
+                    num_batch += 1
+                    val_progress_bar.set_postfix({'val_loss': f'{batch_loss:.4f}'})
+
+            val_loss /= num_batch
+            val_loss_history.append(val_loss)
+            print(f"Validation Loss 10log(AVG_MSE): {val_loss}")
+
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+
+            # Save checkpoint
+            save_checkpoint(
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                train_loss=avg_train_loss,
+                val_loss=val_loss,
+                output_dir=args.output_dir,
+                is_best=is_best
+            )
+
         scheduler.step()
+
+    print(f"Training completed. Best validation loss: {best_val_loss}")

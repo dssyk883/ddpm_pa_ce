@@ -1,13 +1,15 @@
 python ddpm.py \
-          --data_dir ./dataset \
-          --train_dir ./dataset/train_small \
-          --val_dir ./dataset/val_small \
-          --test_dir ./dataset/test/SNR_test_set/SNR_10 \
-          --batch_size 64 \
-          --tsteps 500  \
-          --hidden 256 \
-          --lr 3e-4 \
-          --epochs 75 \
-          --every_n_epoch 10 \
-          --device cuda:0 \
-          --val_portion 0.01
+    --train_dir ./dataset/train_small \
+    --val_dir ./dataset/val_small \
+    --output_dir ./checkpoints \
+    --batch_size 64 \
+    --tsteps 1000 \
+    --hidden 256 \
+    --lr 3e-4 \
+    --patience 20 \
+    --epochs 4 \
+    --every_n_epoch 2 \
+    --device cuda:0 \
+    --val_portion 0.01 \
+    --train_portion 0.025 \
+    --checkpoint ./checkpoints/best_model.pth

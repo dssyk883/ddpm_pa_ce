@@ -7,7 +7,6 @@ import pandas as pd
 import scipy.io as sio
 from collections import defaultdict
 from dataloader import get_test_dataloaders
-import gc
 import os
 import json
 from ddpm import ConditionalUnet, Diffusion
@@ -19,7 +18,7 @@ def create_parser():
 
     # Model checkpoint
     parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to best model checkpoint')
+                        help='Path to model checkpoint')
 
     # Data parameters
     parser.add_argument('--test_path', type=str, required=True,
@@ -30,12 +29,14 @@ def create_parser():
                         help='Path to sample folder for qualitative results')
     parser.add_argument('--pilot_dims', nargs=2, type=int, default=[18, 2],
                         help='Dimensions of pilot signal (height width)')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size for sampling')
 
     # Output parameters
     parser.add_argument('--output_dir', type=str, default='paper_results_diffusion',
                         help='Directory to save results')
+
+    parser.add_argument("--test_portion", type=float, default=1.0)
 
     # Device
     parser.add_argument('--device', type=str, default='cuda:0',
@@ -63,6 +64,11 @@ def calculate_avg_nmse_db(model, diffusion, dataloader, device):
     model.eval()
     nmse_values = []
 
+    def progress_callback(t):
+        # Update progress only at certain intervals to avoid flooding the output
+        if t % 25 == 0 or t == diffusion.n_steps - 1:
+            print(f"\rDenoising step {diffusion.n_steps - t}/{diffusion.n_steps}", end="")
+
     with torch.no_grad():
         for inputs, targets, _ in tqdm(dataloader, desc='Calculating NMSE'):
             inputs = inputs.to(device)
@@ -71,7 +77,8 @@ def calculate_avg_nmse_db(model, diffusion, dataloader, device):
             # Generate samples using diffusion process
             outputs = diffusion.sample(
                 inputs,
-                shape=(inputs.shape[0], 2, 120, 14)
+                shape=(inputs.shape[0], 2, 120, 14),
+                progress_callback=progress_callback
             )
 
             # Calculate squared error
@@ -135,10 +142,18 @@ def generate_qualitative_samples(model, diffusion, sample_path, output_dir, devi
 
         # Prepare input tensor
         complex_input = torch.tensor(data["H"][:, :, 1], dtype=torch.cfloat)
+        # Remove zero entries, keep only pilot values (non-zero values)
+        zero_complex = torch.complex(torch.tensor(0.0), torch.tensor(0.0))
+        hp_ls = complex_input[complex_input != zero_complex]
+
+        if hp_ls.numel() != 36:
+            raise ValueError("Unexpected number of non-zero elements in channel estimate")
+
+        hp_ls = hp_ls.unsqueeze(dim=1).view(2, 18).t()
         two_ch_input = torch.cat([
-            torch.real(complex_input).unsqueeze(0),
-            torch.imag(complex_input).unsqueeze(0)
-        ], dim=0).to(device).unsqueeze(0)
+            torch.real(hp_ls).unsqueeze(0),
+            torch.imag(hp_ls).unsqueeze(0)
+        ], dim=0).unsqueeze(dim=0).to(device)
 
         # Generate sample using diffusion process
         with torch.no_grad():

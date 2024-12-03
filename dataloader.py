@@ -1,5 +1,4 @@
 """Module for loading and processing .mat files containing channel estimates for PyTorch."""
-
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -21,6 +20,7 @@ class ReturnType(Enum):
     CONCAT_TIME = "concat_time"
     INTERPOLATED_COMPLEX = "interpolated_complex",
     TWO_CHANNEL_ZERO = "2channel_zero"
+    COMPLEX_ZERO = "complex_zero"
 
     @classmethod
     def from_string(cls, value: str) -> "ReturnType":
@@ -143,8 +143,12 @@ class MatDataset(Dataset):
                     torch.real(h_ideal).unsqueeze(0),
                     torch.imag(h_ideal).unsqueeze(0)
                 ], dim=0)
-            else:  # ReturnType.COMPLEX
+            elif self.return_type == ReturnType.COMPLEX:  # ReturnType.COMPLEX
                 h_est = hp_ls
+            elif self.return_type == ReturnType.COMPLEX_ZERO:
+                h_est = hzero_ls
+            else:
+                raise ValueError(f"Unexpected return type: {self.return_type}")
 
             return h_est, h_ideal
 
@@ -214,7 +218,9 @@ class MatDataset(Dataset):
             h_ideal = torch.tensor(mat_data["H"][:, :, 0], dtype=torch.cfloat)
 
             # Process data based on return type
-            if self.return_type in (ReturnType.TWO_CHANNEL, ReturnType.COMPLEX, ReturnType.TWO_CHANNEL_ZERO):
+            if self.return_type in (
+                    ReturnType.TWO_CHANNEL, ReturnType.COMPLEX,
+                    ReturnType.TWO_CHANNEL_ZERO, ReturnType.COMPLEX_ZERO):
                 h_est, h_ideal = self._process_2channel_complex(h_ideal, mat_data)
             else:
                 h_est, h_ideal = self._process_time_based(h_ideal, mat_data)
@@ -235,10 +241,16 @@ class MatDataset(Dataset):
             raise ValueError(f"Error processing file {self.file_list[idx]}: {str(e)}")
 
 
+from pathlib import Path
+from typing import List, Tuple, Union
+from torch.utils.data import DataLoader, Subset
+import math
+
+
 def get_test_dataloaders(
-    dataset_dir: Union[str, Path],
-    params: dict,
-    return_type: str
+        dataset_dir: Union[str, Path],
+        params: dict,
+        return_type: str = "2channel"
 ) -> List[Tuple[str, DataLoader]]:
     """Create DataLoaders for each subdirectory in the dataset directory.
 
@@ -247,6 +259,7 @@ def get_test_dataloaders(
         params: Configuration parameters including:
             - pilot_dims: Tuple of (num_subcarriers, num_ofdm_symbols)
             - batch_size: Number of samples per batch
+            - test_portion: Float between 0 and 1 indicating portion of dataset to use
         return_type: Format of returned tensors (e.g., "2channel", "complex")
 
     Returns:
@@ -260,30 +273,41 @@ def get_test_dataloaders(
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
 
-    if not isinstance(params, dict) or "pilot_dims" not in params or "batch_size" not in params:
-        raise ValueError("params must contain 'pilot_dims' and 'batch_size'")
+    required_params = ['pilot_dims', 'batch_size', 'test_portion']
+    if not isinstance(params, dict) or not all(param in params for param in required_params):
+        raise ValueError(f"params must contain: {', '.join(required_params)}")
+
+    if not 0 < params['test_portion'] <= 1:
+        raise ValueError("test_portion must be between 0 and 1")
 
     subdirs = [d for d in dataset_dir.iterdir() if d.is_dir()]
     if not subdirs:
         raise ValueError(f"No subdirectories found in {dataset_dir}")
 
-    test_datasets = [
-        (
-            subdir.name,
-            MatDataset(
-                subdir,
-                params["pilot_dims"],
-                return_type=return_type
-            )
+    test_datasets = []
+    for subdir in subdirs:
+        # Create full dataset
+        full_dataset = MatDataset(
+            subdir,
+            params["pilot_dims"],
+            return_type=return_type
         )
-        for subdir in subdirs
-    ]
+
+        # Calculate subset size
+        total_size = len(full_dataset)
+        subset_size = math.ceil(total_size * params['test_portion'])
+
+        # Create subset
+        subset_indices = range(subset_size)  # Take first subset_size elements
+        subset_dataset = Subset(full_dataset, subset_indices)
+
+        test_datasets.append((subdir.name, subset_dataset))
 
     return [
         (name, DataLoader(
             dataset,
             batch_size=params["batch_size"],
-            shuffle=True,
+            shuffle=False,
             num_workers=0  # Safer default, can be overridden through params
         ))
         for name, dataset in test_datasets

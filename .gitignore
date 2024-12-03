@@ -2,6 +2,8 @@ dataset/
 *__pycache__
 *.pth
 .idea/
-checkpoints/
+*checkpoints*
 *.txt
+*.png
+*.npy
 test_results/
